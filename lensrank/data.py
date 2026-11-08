@@ -2,7 +2,14 @@
 
 from pathlib import Path
 from PIL import Image
+import torch
 from torch.utils.data import Dataset
+
+
+def collate_pairs(items, tokenizer):
+    """Stack image tensors and tokenize captions for a batch."""
+    images, texts = zip(*items)
+    return torch.stack(images), tokenizer(list(texts))
 
 
 class PairDataset(Dataset):

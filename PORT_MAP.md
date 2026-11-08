@@ -20,3 +20,7 @@ Embedding'ler normalize edilir ve dot product ile sıralanır.
 Cache checkpoint_stamp, image_ids, caption_ids, image_embeddings ve text_embeddings alanlarını içerir.
 
 Deney stratejileri zero-shot, projection tuning, full fine-tuning, gradual unfreezing ve LoRA'dır.
+
+Windows worker süreçleri için collate_pairs modül düzeyinde tanımlanır.
+DataLoader tokenizer'ı functools.partial ile bu fonksiyona bağlar.
+Epoch seed'i, shuffle, batch boyutu ve tokenization sırası aynı kalır.

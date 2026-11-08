@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import random
+from functools import partial
 from pathlib import Path
 from typing import Dict
 
@@ -17,8 +18,9 @@ from torch.utils.data import DataLoader
 import open_clip
 
 from .config import EXPERIMENTS, SuiteConfig
-from .adapters import LoRALinear, inject_lora
-from .data import PairDataset
+from .adapters import LoRALinear as LoRALinear
+from .adapters import inject_lora
+from .data import PairDataset, collate_pairs
 from .checkpoints import (
     _remove_empty_directory_artifact,
     atomic_json_save,
@@ -81,10 +83,6 @@ class RetrievalSuite:
         return (model.to(self.cfg.device), preprocess, tokenizer)
 
     def _loader(self, dataset, tokenizer, epoch):
-
-        def collate(items):
-            images, texts = zip(*items)
-            return (torch.stack(images), tokenizer(list(texts)))
         generator = torch.Generator().manual_seed(self.cfg.seed + epoch)
         return DataLoader(
             dataset,
@@ -93,7 +91,7 @@ class RetrievalSuite:
             generator=generator,
             num_workers=self.cfg.num_workers,
             pin_memory=True,
-            collate_fn=collate,
+            collate_fn=partial(collate_pairs, tokenizer=tokenizer),
         )
 
     @torch.no_grad()
