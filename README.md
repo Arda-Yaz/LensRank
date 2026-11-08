@@ -11,8 +11,7 @@ Python 3.12 ile proje klasöründe bir sanal ortam oluşturun.
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt -c constraints.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements-lock.txt
 ```
 
 ## Çalıştırma
@@ -43,3 +42,14 @@ app modülünün import edilmesi de model ve cache yüklemesini başlatır.
 
 Eğitim notebook'u çalıştırıldığında uzun süren GPU işleri başlatabilir.
 Arayüzü açmak için notebook'un çalıştırılması gerekmez.
+
+## Yerel doğrulama
+
+8 Kasım 2026 tarihinde RTX 5060 üzerinde model yükleme, iki yönlü arama,
+cache yeniden kullanımı ve Gradio HTTP/API kontrolleri tamamlandı.
+Veri klasöründe 8000 train, 1000 validation ve 1000 test görseli bulunur.
+Detaylı dosya hash'leri ve kontrol bilgileri SOURCE_MANIFEST.md içindedir.
+
+Windows'ta dört DataLoader worker'ı ile batch sırası ve tensor içerikleri kontrol edildi.
+Arayüz, eval_batch_size=256 ve num_workers=0 ayarlarıyla validation koleksiyonunu arar.
+requirements-lock.txt Windows, Python 3.12 ve CUDA 12.8 ortamı için kaydedilmiştir.
