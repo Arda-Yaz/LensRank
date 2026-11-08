@@ -1,55 +1,54 @@
 # LensRank
 
-LensRank, doğal dil sorgusuyla görsel ve yüklenen görselle açıklama arayan bir Gradio uygulamasıdır.
-Arama koleksiyonu validation kümesidir.
-OpenCLIP ViT-B-16/OpenAI yapılandırması ve LoRA katmanları kullanılır.
-Model seçimi karşılaştırma CSV'sindeki mean_score sıralamasından yapılır.
+LensRank is a multimodal retrieval application with a Gradio interface for text-to-image and image-to-caption search.
+It uses OpenCLIP ViT-B-16/OpenAI with LoRA adapters and searches the validation collection.
+The active experiment is selected by sorting `artifacts/fresh_runs/fresh_comparison.csv` by `mean_score`.
 
-## Kurulum
+## Installation
 
-Python 3.12 ile proje klasöründe bir sanal ortam oluşturun.
+Create a virtual environment with Python 3.12 from the project directory.
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-lock.txt
 ```
 
-## Çalıştırma
+`requirements-lock.txt` contains the validated package versions for Windows, Python 3.12, and CUDA 12.8.
+`requirements.txt` lists the application's dependency requirements.
+
+## Usage
 
 ```powershell
 .\.venv\Scripts\python.exe app.py
 ```
 
-Text → Images sekmesinde bir görseli doğal dille tarif edin.
-Image → Captions sekmesinde bir görsel yükleyin.
-Her iki aramada 1–10 sonuç seçilebilir.
+Enter a natural-language description in **Text → Images**, or upload an image in **Image → Captions**.
+Both search modes support 1–10 results.
 
-İlk açılış validation embedding'lerini artifacts/fresh_runs/demo_validation_index.pt dosyasına yazar.
-Checkpoint değişiklik zamanı aynıysa sonraki açılışlarda bu cache kullanılır.
-Demo eval_batch_size=256 ve num_workers=0 ayarlarıyla çalışır.
-app modülünün import edilmesi de model ve cache yüklemesini başlatır.
+The application builds validation embeddings in `artifacts/fresh_runs/demo_validation_index.pt` on first launch.
+The cache is reused while the checkpoint modification timestamp matches.
+The demo uses `eval_batch_size=256` and `num_workers=0`.
+Importing `app` also initializes the model and cache.
 
-## Dosyalar
+## Project structure
 
-- app.py Gradio arayüzünü ve arama callback'lerini içerir.
-- lensrank/ model, veri, encoding ve evaluation modüllerini içerir.
-- resumable_experiments.py notebook için Python girişlerini sağlar.
-- train_all_models_resumable.ipynb deney yapılandırması ve eğitim hücrelerini içerir.
-- data/ veri tablolarını ve train/validation/test görsellerini içerir.
-- artifacts/fresh_runs/ checkpoint, karşılaştırma ve cache dosyalarını içerir.
-- SOURCE_MANIFEST.md dosya envanterini ve doğrulama durumunu içerir.
-- PORT_MAP.md modül sorumluluklarını gösterir.
+| Path | Purpose |
+| --- | --- |
+| `app.py` | Gradio interface and search callbacks |
+| `lensrank/` | Model configuration, LoRA adapters, data loading, encoding, and evaluation |
+| `resumable_experiments.py` | Public Python imports for the experiment notebook |
+| `train_all_models_resumable.ipynb` | Experiment configuration, training, and evaluation |
+| `data/` | Dataset tables and training, validation, and test images |
+| `artifacts/fresh_runs/` | Checkpoints, experiment records, comparison results, and embedding cache |
+| `SOURCE_MANIFEST.md` | Asset inventory, checksums, and verification results |
+| `PORT_MAP.md` | Module responsibilities and Python entry points |
 
-Eğitim notebook'u çalıştırıldığında uzun süren GPU işleri başlatabilir.
-Arayüzü açmak için notebook'un çalıştırılması gerekmez.
+The training notebook can start long-running GPU jobs when its training cells are executed.
+The interface runs independently of the notebook.
 
-## Yerel doğrulama
+## Verification
 
-8 Kasım 2026 tarihinde RTX 5060 üzerinde model yükleme, iki yönlü arama,
-cache yeniden kullanımı ve Gradio HTTP/API kontrolleri tamamlandı.
-Veri klasöründe 8000 train, 1000 validation ve 1000 test görseli bulunur.
-Detaylı dosya hash'leri ve kontrol bilgileri SOURCE_MANIFEST.md içindedir.
-
-Windows'ta dört DataLoader worker'ı ile batch sırası ve tensor içerikleri kontrol edildi.
-Arayüz, eval_batch_size=256 ve num_workers=0 ayarlarıyla validation koleksiyonunu arar.
-requirements-lock.txt Windows, Python 3.12 ve CUDA 12.8 ortamı için kaydedilmiştir.
+Model loading, bidirectional retrieval, cache reuse, and Gradio HTTP/API behavior have been verified on an RTX 5060.
+The dataset contains 8,000 training images, 1,000 validation images, and 1,000 test images.
+Windows DataLoader batches have been checked with four worker processes for consistent ordering and tensor contents.
+Asset checksums, retrieval metrics, and environment details are listed in `SOURCE_MANIFEST.md`.

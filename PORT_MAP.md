@@ -1,26 +1,29 @@
-# Modül yapısı
+# Module layout
 
-| Python girişi | Modül |
+| Python entry point | Module |
 | --- | --- |
-| SuiteConfig, EXPERIMENTS | lensrank/config.py |
-| LoRALinear, inject_lora | lensrank/adapters.py |
-| PairDataset | lensrank/data.py |
-| atomic_torch_save, atomic_json_save, _remove_empty_directory_artifact | lensrank/checkpoints.py |
-| seed_all, RetrievalSuite | lensrank/experiments.py |
-| load_winner, build_or_load_index, search_images, search_captions | app.py |
+| `SuiteConfig`, `EXPERIMENTS` | `lensrank/config.py` |
+| `LoRALinear`, `inject_lora` | `lensrank/adapters.py` |
+| `PairDataset`, `collate_pairs` | `lensrank/data.py` |
+| `atomic_torch_save`, `atomic_json_save`, `_remove_empty_directory_artifact` | `lensrank/checkpoints.py` |
+| `seed_all`, `RetrievalSuite` | `lensrank/experiments.py` |
+| `load_winner`, `build_or_load_index`, `search_images`, `search_captions` | `app.py` |
 
-resumable_experiments.py notebook ve Python çağrıları için suite girişlerini dışa aktarır.
+`resumable_experiments.py` exports the suite entry points for notebook and Python callers.
 
-LoRA hedefleri c_fc, c_proj, fc1 ve fc2 katmanlarıdır.
-Rank 8 ve alpha 16 kullanılır.
-State dictionary base, a ve b parametrelerini içerir.
+## Model and retrieval
 
-Validation görsel ve caption ID'leri sıralanarak encode edilir.
-Embedding'ler normalize edilir ve dot product ile sıralanır.
-Cache checkpoint_stamp, image_ids, caption_ids, image_embeddings ve text_embeddings alanlarını içerir.
+LoRA targets the `c_fc`, `c_proj`, `fc1`, and `fc2` layers with rank 8 and alpha 16.
+The adapter state dictionary contains the `base`, `a`, and `b` parameters.
 
-Deney stratejileri zero-shot, projection tuning, full fine-tuning, gradual unfreezing ve LoRA'dır.
+Validation image and caption IDs are sorted before encoding.
+Embeddings are normalized and ranked by their dot product.
+The cache contains `checkpoint_stamp`, `image_ids`, `caption_ids`, `image_embeddings`, and `text_embeddings`.
 
-Windows worker süreçleri için collate_pairs modül düzeyinde tanımlanır.
-DataLoader tokenizer'ı functools.partial ile bu fonksiyona bağlar.
-Epoch seed'i, shuffle, batch boyutu ve tokenization sırası aynı kalır.
+The experiment suite supports zero-shot, projection tuning, full fine-tuning, gradual unfreezing, and LoRA.
+
+## Windows data loading
+
+`collate_pairs` is defined at module scope so it can be serialized for worker processes.
+The DataLoader binds the tokenizer with `functools.partial`.
+Epoch seeding, shuffling, batch size, and tokenization order are consistent across worker configurations.

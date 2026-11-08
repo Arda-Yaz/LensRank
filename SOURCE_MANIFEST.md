@@ -1,71 +1,70 @@
-# Dosya envanteri
+# Asset manifest
 
 ## Model
 
-- Yapılandırma OpenCLIP ViT-B-16/OpenAI
-- LoRA hedefleri c_fc, c_proj, fc1, fc2
-- LoRA rank 8, alpha 16
-- Checkpoint artifacts/fresh_runs/openclip_lora/best.pt
-- State dictionary 398 anahtar içerir ve strict yükleme tamamlandı.
-- Validation embedding boyutları görseller için 1000 × 512, açıklamalar için 5000 × 512.
+- Configuration uses OpenCLIP ViT-B-16/OpenAI.
+- LoRA targets `c_fc`, `c_proj`, `fc1`, and `fc2` with rank 8 and alpha 16.
+- The checkpoint is stored at `artifacts/fresh_runs/openclip_lora/best.pt`.
+- The state dictionary contains 398 keys and passes strict loading.
+- Validation embeddings have shapes `1000 × 512` for images and `5000 × 512` for captions.
 
-## Veri
+## Dataset
 
-| Bölüm | CSV satırı | Görsel |
+| Split | CSV rows | Images |
 | --- | --- | --- |
-| Train | 40000 | 8000 |
-| Validation | 5000 | 1000 |
-| Test | 1000 | 1000 |
+| Training | 40,000 | 8,000 |
+| Validation | 5,000 | 1,000 |
+| Test | 1,000 | 1,000 |
 
-Train ve validation tabloları image_id/caption_id eşlemelerini içerir.
-Test tablosu id/query/query_type alanlarıyla 500 image ve 500 caption sorgusu içerir.
-10.000 görselin açılabilirliği ve sorgu ID eşlemeleri kontrol edildi.
-data/manifest.json veri dosyaları ve deney kayıtlarının dosya bazında SHA-256 envanterini içerir.
-Görseller ve ağırlık dosyaları yerel diskte tutulur.
+The training and validation tables contain `image_id` and `caption_id` mappings.
+The test table uses `id`, `query`, and `query_type` fields for 500 image queries and 500 caption queries.
+All 10,000 images pass image-file verification, and query IDs resolve to their corresponding pool entries.
+`data/manifest.json` contains per-file SHA-256 checksums for dataset files and experiment records.
+Images and model weights are stored locally.
 
-## Ortam
+## Environment
 
-8 Kasım 2026 tarihinde Windows üzerinde doğrulandı.
+The application is verified on Windows with the following environment.
 
 - Python 3.12.14
-- GPU NVIDIA GeForce RTX 5060, 8151 MiB
+- NVIDIA GeForce RTX 5060 with 8,151 MiB of VRAM
 - PyTorch 2.7.1+cu128
 - Torchvision 0.22.1+cu128
 - OpenCLIP 2.32.0
 - Gradio 5.49.1
 - Uvicorn 0.35.0
 
-Tam paket sürümleri requirements-lock.txt dosyasındadır.
-Uvicorn sürümü, Gradio sunucusunun Windows'ta hatasız kapanması için 0.35.0 olarak sabitlendi.
+`requirements-lock.txt` contains the complete package versions.
+Uvicorn is pinned to 0.35.0 to support clean Gradio server shutdown on Windows.
 
-## Doğrulama
+## Verification
 
-- Checkpoint boyutu ve SHA-256 eşleşti.
-- Modelin GPU üzerinde yüklenmesi ve inference tamamlandı.
-- Metin aramasında ve görselden açıklama aramasında 1, 5 ve 10 sonuç kontrol edildi.
-- Boş metin ve eksik görsel davranışları kontrol edildi.
-- Embedding değerlerinin sonlu ve normalize olduğu doğrulandı.
-- Cache yeniden kullanıldığında dosyanın değişiklik zamanı ve embedding içeriği aynı kaldı.
-- Dört worker ile yüklenen gerçek veri batch'leri tek işlemli yüklemeyle birebir eşleşti.
-- Yerel HTTP yanıtı 200. İki Gradio arama endpoint'i beşer sonuç döndürdü.
-- Sunucu açılışı ve kapanışı tamamlandı.
-- pip check bağımlılık uyuşmazlığı bildirmedi.
-- Python dosyaları ve notebook kod hücreleri sözdizimi kontrolünden geçti.
+- Checkpoint size and SHA-256 match the expected values.
+- Model loading and GPU inference complete successfully.
+- Both retrieval directions return the requested 1, 5, and 10 results.
+- Empty text and missing-image inputs produce the expected responses.
+- Embeddings contain finite values and have unit norms.
+- Cache reuse preserves the cache file's modification timestamp and embedding contents.
+- Real-data batches loaded with four workers match single-process batches exactly.
+- The local HTTP endpoint returns 200, and both Gradio search endpoints return five results.
+- Server startup and shutdown complete successfully.
+- `pip check` reports no dependency conflicts.
+- Python modules and notebook code cells pass syntax checks.
 
-OpenCLIP ViT-B-16/OpenAI eşleşmesinde QuickGELU aktivasyonu hakkında uyarı verir.
-Model adı ve aktivasyon seçimi yapılandırmadaki haliyle kullanılır.
-Validation cache'i üzerinden altı Recall metriği hesaplandı ve karşılaştırma tablosuyla eşleşti.
+OpenCLIP emits a QuickGELU activation warning for the ViT-B-16/OpenAI combination.
+The model name and activation selection follow the application configuration.
+All six Recall metrics computed from the validation cache match the comparison table.
 
-| Yön | R@1 | R@5 | R@10 |
+| Direction | R@1 | R@5 | R@10 |
 | --- | --- | --- | --- |
 | Image → Text | 0.886 | 0.988 | 0.999 |
 | Text → Image | 0.7592 | 0.9452 | 0.976 |
 
-Bu kontrolde cache embedding'leri kullanıldı.
+The Recall check uses the cached validation embeddings.
 
-## SHA-256 kayıtları
+## SHA-256 checksums
 
-| Dosya | Bayt | SHA-256 |
+| File | Bytes | SHA-256 |
 | --- | --- | --- |
 | artifacts/fresh_runs/openclip_lora/best.pt | 603549475 | b9c2631b47db0830f3e745186c8f983ea9bb6fb011bec446fa692ee1994005c7 |
 | artifacts/fresh_runs/fresh_comparison.csv | 923 | 0be9bf1619c201e383174c98ca8ce12362a6c790c3fe127758c41073c6f13335 |
