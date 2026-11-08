@@ -54,7 +54,14 @@ Uvicorn sürümü, Gradio sunucusunun Windows'ta hatasız kapanması için 0.35.
 
 OpenCLIP ViT-B-16/OpenAI eşleşmesinde QuickGELU aktivasyonu hakkında uyarı verir.
 Model adı ve aktivasyon seçimi yapılandırmadaki haliyle kullanılır.
-Bu kontroller yeni bir retrieval performans ölçümü içermez.
+Validation cache'i üzerinden altı Recall metriği hesaplandı ve karşılaştırma tablosuyla eşleşti.
+
+| Yön | R@1 | R@5 | R@10 |
+| --- | --- | --- | --- |
+| Image → Text | 0.886 | 0.988 | 0.999 |
+| Text → Image | 0.7592 | 0.9452 | 0.976 |
+
+Bu kontrolde cache embedding'leri kullanıldı.
 
 ## SHA-256 kayıtları
 
