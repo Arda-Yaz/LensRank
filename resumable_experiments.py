@@ -1,4 +1,4 @@
-"""Compatibility imports for the original notebook and Python entry points."""
+"""Public imports for the notebook and Python entry points."""
 
 from lensrank.experiments import (
     EXPERIMENTS,

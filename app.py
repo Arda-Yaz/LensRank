@@ -1,4 +1,4 @@
-"""LensRank demo using the winning published retrieval checkpoint.
+"""LensRank image and caption retrieval application.
 
 Run from this directory:
     python app.py

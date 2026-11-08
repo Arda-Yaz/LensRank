@@ -1,4 +1,4 @@
-"""LoRA adapter layers."""
+"""LoRA linear layers for transformer MLP projections."""
 
 import numpy as np
 import torch

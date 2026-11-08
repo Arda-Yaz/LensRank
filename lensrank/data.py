@@ -1,4 +1,4 @@
-"""Image and caption pair data."""
+"""Image and caption pair dataset."""
 
 from pathlib import Path
 from PIL import Image

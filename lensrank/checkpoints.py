@@ -1,4 +1,4 @@
-"""Checkpoint persistence."""
+"""Atomic checkpoint and JSON persistence."""
 
 import json
 import os
