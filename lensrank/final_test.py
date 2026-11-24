@@ -26,8 +26,8 @@ def _write_new(path, value):
         stream.write(encoded + '\n')
 
 
-def freeze_selection(run_dir):
-    """Read validation artifacts only and lock the winner, epoch and weight identity."""
+def freeze_selection(run_dir, *, experiment=None):
+    """Lock a validation checkpoint for the winner or a preselected strategy."""
     run_dir = Path(run_dir).resolve()
     comparison = run_dir / 'fresh_comparison.csv'
     comparison_bytes = comparison.read_bytes()
@@ -36,6 +36,10 @@ def freeze_selection(run_dir):
         raise ValueError(f'No usable validation comparison at {comparison}')
     if not table.mean_score.map(math.isfinite).all() or table.experiment.duplicated().any():
         raise ValueError(f'Ambiguous validation comparison at {comparison}')
+    if experiment is not None:
+        table = table.loc[table.experiment.eq(experiment)]
+        if table.empty:
+            raise ValueError(f'No validation result for {experiment!r} at {comparison}')
     winner = table.sort_values('mean_score', ascending=False, kind='stable').iloc[0]
     name = str(winner['experiment'])
     if not name or Path(name).name != name or name in {'.', '..'}:
@@ -108,7 +112,7 @@ def evaluate_frozen(selection, data_dir, device, eval_batch_size):
         raise ValueError('Frozen checkpoint kind disagrees with the selected strategy')
     cfg = SuiteConfig(data_dir=str(data_dir), model_name=selection['model'], pretrained=selection['pretrained'],
                       device=device, seed=selection['seed'], eval_batch_size=eval_batch_size)
-    suite = RetrievalSuite(cfg)
+    suite = RetrievalSuite(cfg, verify_images=True)
     if selection['data_identity'] and suite.data_identity != selection['data_identity']:
         raise ValueError('Dataset identity differs from the frozen validation run')
     weights = None
@@ -160,6 +164,7 @@ def main(argv=None):
     commands = parser.add_subparsers(dest='command', required=True)
     select = commands.add_parser('select', help='freeze the winner from validation records')
     select.add_argument('--run-dir', type=Path, required=True)
+    select.add_argument('--experiment', help='freeze a strategy chosen by a separate validation comparison')
     select.add_argument('--selection', type=Path, required=True)
     evaluate = commands.add_parser('evaluate', help='evaluate a frozen selection on the local test split')
     evaluate.add_argument('--selection', type=Path, required=True)
@@ -169,7 +174,7 @@ def main(argv=None):
     evaluate.add_argument('--output', type=Path, required=True)
     args = parser.parse_args(argv)
     if args.command == 'select':
-        _write_new(args.selection, freeze_selection(args.run_dir))
+        _write_new(args.selection, freeze_selection(args.run_dir, experiment=args.experiment))
     else:
         if args.output.exists():
             raise FileExistsError(f'Final report already exists: {args.output}')

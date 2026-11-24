@@ -1,5 +1,6 @@
 import json
 import random
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,7 +15,7 @@ from torch import nn
 from lensrank import experiments
 from lensrank.data import ImageBatchSampler, PairDataset
 from lensrank.final_test import freeze_selection, main
-from lensrank.provenance import resolve_pretrained
+from lensrank.provenance import file_sha256, resolve_pretrained
 from lensrank.retrieval import retrieval_recall
 from resumable_experiments import RetrievalSuite, SuiteConfig
 
@@ -259,6 +260,58 @@ class RetrievalProtocolTests(unittest.TestCase):
                     checkpoint.unlink()
                     with self.assertRaisesRegex(FileNotFoundError, 'requires its checkpoint'):
                         freeze_selection(suite.runs)
+
+    def test_final_evaluation_checks_manifest_image_contents(self):
+        image = self.data / 'test_images/test_images/7.png'
+        original = image.read_bytes()
+        manifest = [{'path': image.relative_to(self.data).as_posix(),
+                     'bytes': len(original), 'sha256': file_sha256(image)}]
+        (self.data / 'manifest.json').write_text(json.dumps(manifest))
+        suite = self.suite('verify_images')
+        suite.run_all({'full': {'strategy': 'full', 'lr': 0.005}})
+        selection = self.root / 'selection.json'
+        report = self.root / 'report.json'
+        main(['select', '--run-dir', str(suite.runs), '--selection', str(selection)])
+        image.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+        with self.assertRaisesRegex(ValueError, 'Image SHA-256 differs'):
+            main(['evaluate', '--selection', str(selection), '--data-dir', str(self.data),
+                  '--device', 'cpu', '--output', str(report)])
+        self.assertFalse(report.exists())
+
+    def test_moved_run_and_docs_revision_keep_original_identity(self):
+        spec = {'strategy': 'full', 'lr': 0.005}
+        suite = self.suite('original')
+        reference = self.suite('reference')
+        reference.run_one('full', spec)
+        save = experiments.atomic_torch_save
+
+        def interrupt_after_first_batch(value, path):
+            save(value, path)
+            if path.name == 'last.pt':
+                raise KeyboardInterrupt
+
+        with (patch('lensrank.provenance._git_revision', return_value='original-revision'),
+              patch.object(experiments, 'atomic_torch_save', interrupt_after_first_batch),
+              self.assertRaises(KeyboardInterrupt)):
+            suite.run_one('full', spec)
+        original = json.loads((suite.runs / 'full' / 'run.json').read_text())
+        moved_data = self.root / 'moved_data'
+        shutil.copytree(self.data, moved_data, copy_function=shutil.copy2)
+        moved = self.root / 'moved_run'
+        suite.runs.rename(moved)
+        suite.cfg.run_dir = moved
+        suite.cfg.data_dir = moved_data
+        relocated = RetrievalSuite(suite.cfg)
+        with patch('lensrank.provenance._git_revision', return_value='docs-only-revision'):
+            resumed = relocated.run_one('full', spec)
+            self.assertEqual(resumed['run_identity'], original)
+            self.assertEqual(relocated.run_one('full', spec), resumed)
+            with self.assertRaisesRegex(ValueError, 'identity mismatch'):
+                relocated.run_one('full', {**spec, 'lr': 0.01})
+        expected = torch.load(reference.runs / 'full' / 'last.pt', weights_only=False)
+        actual = torch.load(relocated.runs / 'full' / 'last.pt', weights_only=False)
+        torch.testing.assert_close(actual['model'], expected['model'], atol=0, rtol=0)
+        self.assertEqual(actual['history'], expected['history'])
 
 
 if __name__ == '__main__':

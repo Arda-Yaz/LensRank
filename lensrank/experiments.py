@@ -34,7 +34,13 @@ from .data import (
     read_table,
     validate_splits,
 )
-from .provenance import data_identity, file_sha256, resolve_pretrained, run_identity
+from .provenance import (
+    data_identity,
+    execution_fingerprint,
+    file_sha256,
+    resolve_pretrained,
+    run_identity,
+)
 from .retrieval import retrieval_recall
 
 __all__ = [
@@ -53,7 +59,7 @@ def seed_all(seed: int) -> None:
 
 class RetrievalSuite:
 
-    def __init__(self, cfg: SuiteConfig):
+    def __init__(self, cfg: SuiteConfig, *, verify_images=False):
         self.cfg = cfg
         self.data = Path(cfg.data_dir).resolve()
         self.runs = Path(cfg.run_dir).resolve()
@@ -74,7 +80,9 @@ class RetrievalSuite:
         self.train_dir = self.directories['train']
         self.val_dir = self.directories['val']
         self._validate_data()
-        self.data_identity = data_identity(self.data, self.directories, self.splits, self.image_names)
+        self.data_identity = data_identity(
+            self.data, self.directories, self.splits, self.image_names, verify_images=verify_images,
+        )
 
     def _validate_data(self):
         self.splits, self.caption_owners = validate_splits(
@@ -183,7 +191,9 @@ class RetrievalSuite:
             if recorded is None:
                 atomic_json_save(identity, marker)
             else:
-                self._verify_identity(recorded, identity, marker)
+                if execution_fingerprint(recorded) != execution_fingerprint(identity):
+                    raise ValueError(f'Run identity mismatch at {marker}. Use a separate run_dir.')
+                identity = recorded
             try:
                 return self._run_one(name, spec, folder, identity, weights_path)
             except Exception as exc:

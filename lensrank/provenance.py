@@ -28,7 +28,7 @@ def digest(value):
     return hashlib.sha256(encoded).hexdigest()
 
 
-def data_identity(directory, directories, splits, names):
+def data_identity(directory, directories, splits, names, *, verify_images=False):
     manifest_path = directory / 'manifest.json'
     manifest = {}
     if manifest_path.is_file():
@@ -48,6 +48,8 @@ def data_identity(directory, directories, splits, names):
                 record = manifest[relative]
                 if record.get('bytes', stat.st_size) != stat.st_size:
                     raise ValueError(f'Image size differs from the data manifest: {path}')
+                if verify_images and file_sha256(path) != record['sha256']:
+                    raise ValueError(f'Image SHA-256 differs from the data manifest: {path}')
                 files[relative] = record['sha256']
                 manifest_count += 1
             else:
@@ -147,3 +149,12 @@ def run_identity(cfg, name, spec, dataset, initial_weights):
         },
     }
     return {'id': digest(details), **details}
+
+
+def execution_fingerprint(identity):
+    """Compare execution inputs while retaining the original run's provenance."""
+    details = {key: value for key, value in identity.items() if key != 'id'}
+    details['config'] = {key: value for key, value in identity['config'].items()
+                         if key not in {'data_dir', 'run_dir'}}
+    details['code'] = {key: value for key, value in identity['code'].items() if key != 'git_revision'}
+    return digest(details)
