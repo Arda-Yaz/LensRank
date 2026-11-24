@@ -3,29 +3,45 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 from functools import partial
 from pathlib import Path
-from typing import Dict
+from time import perf_counter
 
 import numpy as np
+import open_clip
 import pandas as pd
-from PIL import Image
-from tqdm.auto import tqdm
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from torch.utils.data import DataLoader
-import open_clip
+from tqdm.auto import tqdm
 
-from .config import EXPERIMENTS, SuiteConfig
-from .adapters import LoRALinear as LoRALinear
-from .adapters import inject_lora
-from .data import PairDataset, collate_pairs
+from .adapters import LoRALinear, inject_lora
 from .checkpoints import (
     _remove_empty_directory_artifact,
+    atomic_csv_save,
     atomic_json_save,
     atomic_torch_save,
+    run_lock,
 )
+from .config import EXPERIMENTS, SuiteConfig
+from .data import (
+    ImageBatchSampler,
+    PairDataset,
+    collate_pairs,
+    read_table,
+    validate_splits,
+)
+from .provenance import data_identity, file_sha256, resolve_pretrained, run_identity
+from .retrieval import retrieval_recall
+
+__all__ = [
+    'EXPERIMENTS', 'LoRALinear', 'PairDataset', 'RetrievalSuite', 'SuiteConfig',
+    '_remove_empty_directory_artifact', 'atomic_json_save', 'atomic_torch_save',
+    'inject_lora', 'seed_all',
+]
 
 
 def seed_all(seed: int) -> None:
@@ -41,28 +57,40 @@ class RetrievalSuite:
         self.cfg = cfg
         self.data = Path(cfg.data_dir).resolve()
         self.runs = Path(cfg.run_dir).resolve()
-        self.runs.mkdir(parents=True, exist_ok=True)
-        seed_all(cfg.seed)
-        self.train = pd.read_csv(self.data / 'train.csv')
-        self.val = pd.read_csv(self.data / 'val.csv')
-        self.test = pd.read_csv(self.data / 'test.csv')
-        self.captions_df = pd.read_csv(self.data / 'caption_pool.csv')
-        self.images_df = pd.read_csv(self.data / 'image_pool.csv')
-        self.captions = self.captions_df.set_index('caption_id').caption.astype(str).to_dict()
-        self.image_names = self.images_df.set_index('image_id').image_name.astype(str).to_dict()
-        self.train_dir = self.data / 'train_images/train_images'
-        self.val_dir = self.data / 'val_images/val_images'
+        for field in ('batch_size', 'eval_batch_size', 'checkpoint_every_batches'):
+            if getattr(cfg, field) < 1:
+                raise ValueError(f'{field} must be positive')
+        self.train = read_table(self.data, 'train', ('caption_id', 'image_id'))
+        self.val = read_table(self.data, 'val', ('caption_id', 'image_id'))
+        self.test = read_table(self.data, 'test', ('id', 'query'), ('query_type',))
+        self.captions_df = read_table(
+            self.data, 'caption_pool', ('caption_id', 'image_id'), ('caption',), empty_caption=True,
+        )
+        self.images_df = read_table(self.data, 'image_pool', ('image_id',), ('image_name',))
+        self.captions = self.captions_df.set_index('caption_id').caption.to_dict()
+        self.image_names = self.images_df.set_index('image_id').image_name.to_dict()
+        self.directories = {split: self.data / f'{split}_images' / f'{split}_images'
+                            for split in ('train', 'val', 'test')}
+        self.train_dir = self.directories['train']
+        self.val_dir = self.directories['val']
         self._validate_data()
+        self.data_identity = data_identity(self.data, self.directories, self.splits, self.image_names)
 
     def _validate_data(self):
-        assert {'image_id', 'caption_id'} <= set(self.train)
-        assert {'image_id', 'caption_id'} <= set(self.val)
-        missing = [i for i in self.train.image_id.unique() if not (self.train_dir / Path(self.image_names[int(i)]).name).exists()]
-        if missing:
-            raise FileNotFoundError(f'Missing {len(missing)} training images; first ID: {missing[0]}')
+        self.splits, self.caption_owners = validate_splits(
+            self.train, self.val, self.test, self.images_df, self.captions_df, self.directories,
+        )
 
-    def _build_model(self, spec):
-        model, _, preprocess = open_clip.create_model_and_transforms(self.cfg.model_name, pretrained=self.cfg.pretrained)
+    def _build_model(self, spec, *, weights_path=None, checkpoint_only=False):
+        pretrained = self.cfg.pretrained
+        options = {}
+        if weights_path is not None or checkpoint_only:
+            metadata = open_clip.get_pretrained_cfg(self.cfg.model_name, str(pretrained or '')) or {}
+            options = {f'image_{key}': metadata[key] for key in ('mean', 'std', 'interpolation', 'resize_mode')
+                       if key in metadata}
+            pretrained = str(weights_path) if weights_path is not None else None
+            options['pretrained_hf'] = False
+        model, _, preprocess = open_clip.create_model_and_transforms(self.cfg.model_name, pretrained=pretrained, **options)
         tokenizer = open_clip.get_tokenizer(self.cfg.model_name)
         strategy = spec['strategy']
         if strategy in {'zero_shot', 'projection', 'lora', 'gradual'}:
@@ -70,7 +98,7 @@ class RetrievalSuite:
                 p.requires_grad = False
         if strategy in {'projection', 'gradual'}:
             for n, p in model.named_parameters():
-                if any((x in n for x in ('visual.proj', 'text_projection', 'ln_post', 'ln_final', 'logit_scale'))):
+                if any(x in n for x in ('visual.proj', 'text_projection', 'ln_post', 'ln_final', 'logit_scale')):
                     p.requires_grad = True
         elif strategy == 'lora':
             count = inject_lora(model, spec.get('lora_rank', 8), spec.get('lora_alpha', 16))
@@ -82,12 +110,13 @@ class RetrievalSuite:
                 p.requires_grad = True
         return (model.to(self.cfg.device), preprocess, tokenizer)
 
-    def _loader(self, dataset, tokenizer, epoch):
+    def _loader(self, dataset, tokenizer, epoch, start_batch=0):
         generator = torch.Generator().manual_seed(self.cfg.seed + epoch)
         return DataLoader(
             dataset,
-            batch_size=self.cfg.batch_size,
-            shuffle=True,
+            batch_sampler=ImageBatchSampler(
+                dataset.pairs.image_id, self.cfg.batch_size, self.cfg.seed, epoch, start_batch,
+            ),
             generator=generator,
             num_workers=self.cfg.num_workers,
             pin_memory=True,
@@ -99,12 +128,10 @@ class RetrievalSuite:
         model.eval()
         output = []
         for start in range(0, len(ids), self.cfg.eval_batch_size):
-            batch = [
-                preprocess(
-                    Image.open(Path(directory) / Path(self.image_names[i]).name).convert('RGB')
-                )
-                for i in ids[start:start + self.cfg.eval_batch_size]
-            ]
+            batch = []
+            for i in ids[start:start + self.cfg.eval_batch_size]:
+                with Image.open(Path(directory) / Path(self.image_names[i]).name) as image:
+                    batch.append(preprocess(image.convert('RGB')))
             z = model.encode_image(torch.stack(batch).to(self.cfg.device))
             output.append(F.normalize(z, dim=-1).cpu())
         return torch.cat(output)
@@ -118,140 +145,233 @@ class RetrievalSuite:
             output.append(F.normalize(model.encode_text(tok), dim=-1).cpu())
         return torch.cat(output)
 
-    @staticmethod
-    def _recall(pred, truth, k):
-        return float(np.mean([bool(set(p[:k]) & set(t if isinstance(t, list) else [t])) for p, t in zip(pred, truth)]))
-
     @torch.no_grad()
     def evaluate(self, model, preprocess, tokenizer):
-        image_ids = sorted(self.val.image_id.unique().astype(int))
-        caption_ids = sorted(self.val.caption_id.unique().astype(int))
-        ie = self._encode_images(model, preprocess, image_ids, self.val_dir)
+        return self._evaluate_split(model, preprocess, tokenizer, 'val')
+
+    @torch.no_grad()
+    def _evaluate_split(self, model, preprocess, tokenizer, split, image_queries=None, caption_queries=None):
+        image_ids, caption_ids = map(sorted, self.splits[split])
+        ie = self._encode_images(model, preprocess, image_ids, self.directories[split])
         te = self._encode_text(model, tokenizer, caption_ids)
-        sim = ie @ te.T
-        ip = [[caption_ids[j] for j in row] for row in sim.topk(10, dim=1).indices.tolist()]
-        tp = [[image_ids[j] for j in row] for row in sim.T.topk(10, dim=1).indices.tolist()]
-        igt = self.val.groupby('image_id').caption_id.apply(list).to_dict()
-        tgt = self.val.set_index('caption_id').image_id.to_dict()
-        m = {}
-        for k in (1, 5, 10):
-            m[f'i2t_R@{k}'] = self._recall(ip, [igt[i] for i in image_ids], k)
-        for k in (1, 5, 10):
-            m[f't2i_R@{k}'] = self._recall(tp, [int(tgt[i]) for i in caption_ids], k)
-        m['i2t_score'] = np.mean([m[f'i2t_R@{k}'] for k in (1, 5, 10)])
-        m['t2i_score'] = np.mean([m[f't2i_R@{k}'] for k in (1, 5, 10)])
-        m['mean_score'] = (m['i2t_score'] + m['t2i_score']) / 2
-        return {k: float(v) for k, v in m.items()}
+        return retrieval_recall(ie, te, image_ids, caption_ids, self.caption_owners,
+                                image_queries, caption_queries)
 
-    def _state(self, model, optimizer, scaler, epoch, next_batch, history, best):
-        return {
-            'model': model.state_dict(),
-            'optimizer': optimizer.state_dict() if optimizer else None,
-            'scaler': scaler.state_dict() if scaler else None,
-            'epoch': epoch,
-            'next_batch': next_batch,
-            'history': history,
-            'best': best,
-            'torch_rng': torch.get_rng_state(),
-            'cuda_rng': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-        }
+    def run_one(self, name: str, spec: dict):
+        if not name or Path(name).name != name or name in {'.', '..'}:
+            raise ValueError(f'Invalid experiment name: {name!r}')
+        spec = dict(spec)
+        strategy = spec['strategy']
+        spec['epochs'] = 0 if strategy == 'zero_shot' else spec.get('epochs', self.cfg.epochs)
+        if strategy not in {item['strategy'] for item in EXPERIMENTS.values()}:
+            raise ValueError(f'Unknown strategy: {strategy}')
+        if strategy != 'zero_shot' and spec['epochs'] < 1:
+            raise ValueError('Training requires at least one epoch')
+        if strategy == 'gradual':
+            spec['unfreeze_epoch'] = max(2, spec['epochs'] // 2)
+        if strategy == 'lora':
+            spec.setdefault('lora_rank', 8)
+            spec.setdefault('lora_alpha', 16)
 
-    def run_one(self, name: str, spec: Dict):
         folder = self.runs / name
+        self._read_run_marker(folder)
+        with run_lock(folder):
+            recorded = self._read_run_marker(folder)
+            source, weights_path = resolve_pretrained(self.cfg, download=recorded is None)
+            identity = run_identity(self.cfg, name, spec, self.data_identity, source)
+            marker = folder / 'run.json'
+            if recorded is None:
+                atomic_json_save(identity, marker)
+            else:
+                self._verify_identity(recorded, identity, marker)
+            try:
+                return self._run_one(name, spec, folder, identity, weights_path)
+            except Exception as exc:
+                atomic_json_save({'experiment': name, 'status': 'failed', 'error': repr(exc)},
+                                 folder / 'failure.json')
+                raise
+
+    @staticmethod
+    def _read_run_marker(folder):
+        marker = folder / 'run.json'
+        if marker.is_file():
+            return json.loads(marker.read_text(encoding='utf-8'))
+        if folder.exists() and any(path.name not in {'.run.lock', 'run.json.tmp'} for path in folder.iterdir()):
+            raise ValueError(f'Legacy or unidentified run at {folder}. Use a separate run_dir.')
+
+    @staticmethod
+    def _verify_identity(recorded, expected, path):
+        if recorded != expected:
+            raise ValueError(f'Run identity mismatch at {path}. Use a separate run_dir.')
+
+    @staticmethod
+    def _restore_best(folder, selection):
+        if selection is None:
+            return
+        best = folder / 'best.pt'
+        staged = folder / 'best.pending.pt'
+        for path in (best, staged):
+            if path.is_file() and file_sha256(path) == selection['sha256']:
+                if path == staged:
+                    os.replace(staged, best)
+                return
+        raise RuntimeError(f'Best checkpoint for epoch {selection["epoch"]} is missing or changed in {folder}')
+
+    def _run_one(self, name, spec, folder, identity, weights_path):
         done = folder / 'completed.json'
         last = folder / 'last.pt'
-        folder.mkdir(parents=True, exist_ok=True)
-        _remove_empty_directory_artifact(done)
-        _remove_empty_directory_artifact(last)
-        _remove_empty_directory_artifact(folder / 'failure.json')
         if done.exists():
+            result = json.loads(done.read_text(encoding='utf-8'))
+            self._verify_identity(result.get('run_identity'), identity, done)
+            if result['checkpoint']['kind'] == 'trained':
+                self._restore_best(folder, result['checkpoint'])
             print(f'[skip] {name} is complete')
-            return json.loads(done.read_text())
-        model, preprocess, tokenizer = self._build_model(spec)
-        epochs = 0 if spec['strategy'] == 'zero_shot' else spec.get('epochs', self.cfg.epochs)
-        unfreeze_epoch = max(2, epochs // 2)
-        history = []
-        best = -1.0
-        start_epoch = 1
-        start_batch = 0
+            return result
+
         state = None
         if last.exists():
-            state = torch.load(last, map_location=self.cfg.device, weights_only=False)
+            state = torch.load(last, map_location='cpu', weights_only=False)
+            self._verify_identity(state.get('run_identity'), identity, last)
+            self._restore_best(folder, state['best_checkpoint'])
+        seed_all(self.cfg.seed)
+        model, preprocess, tokenizer = self._build_model(spec, weights_path=weights_path)
+        epochs = spec['epochs']
+        unfreeze_epoch = spec.get('unfreeze_epoch')
+        history = state['history'] if state else []
+        best = state['best'] if state else -1.0
+        best_checkpoint = state['best_checkpoint'] if state else None
+        start_epoch = state['epoch'] if state else 1
+        start_batch = state['next_batch'] if state else 0
+        stages = state['optimizer_stages'] if state else []
+        if state:
             model.load_state_dict(state['model'])
-            history, best = (state['history'], state['best'])
-            start_epoch, start_batch = (state['epoch'], state['next_batch'])
             print(f'[resume] {name}: epoch {start_epoch}, batch {start_batch}')
-        full_gradual = spec['strategy'] == 'gradual' and (start_epoch > unfreeze_epoch or (start_epoch == unfreeze_epoch and start_batch > 0))
-        if full_gradual:
-            for p in model.parameters():
-                p.requires_grad = True
-        trainable = [p for p in model.parameters() if p.requires_grad]
-        if epochs > 0 and (not trainable):
-            raise RuntimeError(f'Experiment {name!r} selected no trainable parameters')
-        optimizer = torch.optim.AdamW(trainable, lr=spec['lr'], weight_decay=0.0001) if trainable else None
-        scaler = torch.amp.GradScaler('cuda', enabled=self.cfg.device == 'cuda' and optimizer is not None)
-        if (
-            state is not None
-            and optimizer
-            and state['optimizer']
-            and not (
-                spec['strategy'] == 'gradual'
-                and start_epoch == unfreeze_epoch
-                and start_batch == 0
-            )
-        ):
-            optimizer.load_state_dict(state['optimizer'])
+        optimizer = None
+
+        def make_optimizer(first_epoch, unfreeze=False):
+            if unfreeze:
+                model.requires_grad_(True)
+            parameters = {key: value for key, value in model.named_parameters() if value.requires_grad}
+            if not parameters:
+                raise RuntimeError(f'Experiment {name!r} selected no trainable parameters')
+            if not stages or stages[-1]['first_epoch'] != first_epoch:
+                stages.append({'first_epoch': first_epoch, 'names': list(parameters),
+                               'parameter_count': sum(p.numel() for p in parameters.values())})
+            return torch.optim.AdamW(parameters.values(), lr=spec['lr'], weight_decay=0.0001)
+
+        if epochs:
+            if unfreeze_epoch is not None and start_epoch >= unfreeze_epoch:
+                optimizer = make_optimizer(unfreeze_epoch, unfreeze=True)
+            else:
+                optimizer = make_optimizer(1)
+            if state and not (start_epoch == unfreeze_epoch and start_batch == 0):
+                optimizer.load_state_dict(state['optimizer'])
+        cuda = torch.device(self.cfg.device).type == 'cuda'
+        scaler = torch.amp.GradScaler('cuda', enabled=cuda and optimizer is not None)
+        if state:
             scaler.load_state_dict(state['scaler'])
-        pairs = self.train.head(512) if self.cfg.fast_dev_run else self.train
-        dataset = PairDataset(pairs, self.train_dir, self.image_names, self.captions, preprocess)
+            random.setstate(state['python_rng'])
+            np.random.set_state(state['numpy_rng'])
+            torch.set_rng_state(state['torch_rng'])
+            if cuda:
+                torch.cuda.set_rng_state_all(state['cuda_rng'])
+        if cuda:
+            torch.cuda.reset_peak_memory_stats(self.cfg.device)
+        started = perf_counter()
+        prior_resources = state['resources'] if state else None
+
+        def resources():
+            peak = None
+            elapsed = perf_counter() - started
+            if prior_resources:
+                elapsed += prior_resources['elapsed_seconds']
+            if cuda:
+                peak = torch.cuda.max_memory_allocated(self.cfg.device)
+                if prior_resources:
+                    peak = max(peak, prior_resources['cuda_peak_allocated_bytes'])
+            return {
+                'elapsed_seconds': elapsed,
+                'scope': 'training and validation after setup, including data loading and in-loop persistence',
+                'cuda_peak_allocated_bytes': peak,
+                'cuda_peak_api': 'torch.cuda.max_memory_allocated' if cuda else None,
+                'cuda_status': 'measured' if cuda else 'not applicable on CPU',
+                'resume_rule': 'sum elapsed time and take maximum CUDA peak across checkpointed segments',
+            }
+
+        def save(epoch, next_batch, loss_sum, loss_count):
+            atomic_torch_save({
+                'run_identity': identity, 'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(), 'scaler': scaler.state_dict(),
+                'epoch': epoch, 'next_batch': next_batch, 'history': history, 'best': best,
+                'best_checkpoint': best_checkpoint, 'optimizer_stages': stages,
+                'loss_sum': loss_sum, 'loss_count': loss_count, 'resources': resources(),
+                'python_rng': random.getstate(), 'numpy_rng': np.random.get_state(),
+                'torch_rng': torch.get_rng_state(),
+                'cuda_rng': torch.cuda.get_rng_state_all() if cuda else None,
+            }, last)
+
         if epochs == 0:
             metrics = self.evaluate(model, preprocess, tokenizer)
-            history = [{'epoch': 0, 'train_loss': np.nan, **metrics}]
+            history = [{'epoch': 0, 'train_loss': None, **metrics}]
+            best_checkpoint = {'kind': 'pretrained', 'epoch': 0, **identity['initial_weights']}
         else:
+            pairs = self.train.head(512) if self.cfg.fast_dev_run else self.train
+            dataset = PairDataset(pairs, self.train_dir, self.image_names, self.captions, preprocess)
             for epoch in range(start_epoch, epochs + 1):
-                if spec['strategy'] == 'gradual' and epoch == unfreeze_epoch and (not full_gradual):
-                    for p in model.parameters():
-                        p.requires_grad = True
-                    optimizer = torch.optim.AdamW(model.parameters(), lr=spec['lr'], weight_decay=0.0001)
-                loader = self._loader(dataset, tokenizer, epoch)
-                model.train()
-                losses = []
+                if epoch == unfreeze_epoch and epoch != start_epoch:
+                    optimizer = make_optimizer(epoch, unfreeze=True)
                 resume_batch = start_batch if epoch == start_epoch else 0
-                for bi, (images, tokens) in enumerate(tqdm(loader, desc=f'{name} e{epoch}')):
-                    if bi < resume_batch:
-                        continue
-                    images, tokens = (images.to(self.cfg.device), tokens.to(self.cfg.device))
-                    optimizer.zero_grad(set_to_none=True)
-                    with torch.autocast('cuda', enabled=self.cfg.device == 'cuda'):
-                        ie = F.normalize(model.encode_image(images), dim=-1)
-                        te = F.normalize(model.encode_text(tokens), dim=-1)
-                        logits = model.logit_scale.exp().clamp(max=100) * (ie @ te.T)
-                        labels = torch.arange(len(images), device=self.cfg.device)
-                        loss = (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
-                    losses.append(loss.item())
+                loss_sum = state['loss_sum'] if state and epoch == start_epoch else 0.0
+                loss_count = state['loss_count'] if state and epoch == start_epoch else 0
+                loader = self._loader(dataset, tokenizer, epoch, resume_batch)
+                model.train()
+                for bi, (images, tokens) in enumerate(tqdm(loader, desc=f'{name} e{epoch}'), resume_batch):
+                    if len(images) > 1:
+                        images, tokens = images.to(self.cfg.device), tokens.to(self.cfg.device)
+                        optimizer.zero_grad(set_to_none=True)
+                        with torch.autocast('cuda', enabled=cuda):
+                            ie = F.normalize(model.encode_image(images), dim=-1)
+                            te = F.normalize(model.encode_text(tokens), dim=-1)
+                            logits = model.logit_scale.exp().clamp(max=100) * (ie @ te.T)
+                            labels = torch.arange(len(images), device=self.cfg.device)
+                            loss = (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2
+                        scaler.scale(loss).backward()
+                        scaler.step(optimizer)
+                        scaler.update()
+                        loss_sum += loss.item()
+                        loss_count += 1
                     if (bi + 1) % self.cfg.checkpoint_every_batches == 0:
-                        atomic_torch_save(self._state(model, optimizer, scaler, epoch, bi + 1, history, best), last)
+                        save(epoch, bi + 1, loss_sum, loss_count)
                 metrics = self.evaluate(model, preprocess, tokenizer)
-                record = {'epoch': epoch, 'train_loss': float(np.mean(losses)), **metrics}
+                record = {'epoch': epoch, 'train_loss': loss_sum / loss_count if loss_count else None, **metrics}
                 history.append(record)
-                pd.DataFrame(history).to_csv(folder / 'history.csv', index=False)
-                if metrics['mean_score'] > best:
+                improved = metrics['mean_score'] > best
+                if improved:
                     best = metrics['mean_score']
-                    atomic_torch_save({'model': model.state_dict(), 'metrics': metrics}, folder / 'best.pt')
-                atomic_torch_save(self._state(model, optimizer, scaler, epoch + 1, 0, history, best), last)
-                start_batch = 0
+                    staged = folder / 'best.pending.pt'
+                    atomic_torch_save({'model': model.state_dict(), 'metrics': metrics, 'epoch': epoch,
+                                       'run_id': identity['id']}, staged)
+                    best_checkpoint = {'kind': 'trained', 'epoch': epoch, 'file': 'best.pt',
+                                       'sha256': file_sha256(staged)}
+                save(epoch + 1, 0, 0.0, 0)
+                if improved:
+                    os.replace(staged, folder / 'best.pt')
+                atomic_csv_save(pd.DataFrame(history), folder / 'history.csv')
+        if start_epoch > epochs:
+            atomic_csv_save(pd.DataFrame(history), folder / 'history.csv')
         best_record = max(history, key=lambda x: x['mean_score'])
+        if best_checkpoint['epoch'] != best_record['epoch']:
+            raise RuntimeError('Best checkpoint and validation history select different epochs')
         result = {
             'experiment': name,
             'strategy': spec['strategy'],
             'status': 'completed',
             'best_epoch': best_record['epoch'],
-            'trainable_parameters': sum(
-                p.numel() for p in model.parameters() if p.requires_grad
-            ),
+            'trainable_parameters': stages[-1]['parameter_count'] if stages else 0,
+            'run_identity': identity,
+            'checkpoint': best_checkpoint,
+            'optimizer_stages': stages,
+            'resources': resources(),
             **best_record,
         }
         atomic_json_save(result, done)
@@ -260,15 +380,29 @@ class RetrievalSuite:
     def run_all(self, experiments=None):
         experiments = experiments or EXPERIMENTS
         results = []
-        for name, spec in experiments.items():
-            try:
-                results.append(self.run_one(name, spec))
-            except Exception as exc:
-                atomic_json_save({'experiment': name, 'status': 'failed', 'error': repr(exc)}, self.runs / name / 'failure.json')
-                raise
-            finally:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-        table = pd.DataFrame(results).sort_values('mean_score', ascending=False)
-        table.to_csv(self.runs / 'fresh_comparison.csv', index=False)
-        return table
+        comparison = self.runs / 'fresh_comparison.csv'
+
+        def verify_comparison():
+            if comparison.exists() and 'run_id' not in pd.read_csv(comparison, nrows=0):
+                raise ValueError(f'Legacy comparison at {comparison}. Use a separate run_dir.')
+
+        verify_comparison()
+        with run_lock(self.runs):
+            verify_comparison()
+            for name, spec in experiments.items():
+                try:
+                    results.append(self.run_one(name, spec))
+                finally:
+                    if torch.device(self.cfg.device).type == 'cuda':
+                        torch.cuda.empty_cache()
+            details = {'run_identity', 'optimizer_stages', 'checkpoint', 'resources'}
+            rows = [
+                {**{key: value for key, value in result.items() if key not in details},
+                 'run_id': result['run_identity']['id'],
+                 'elapsed_seconds': result['resources']['elapsed_seconds'],
+                 'cuda_peak_allocated_bytes': result['resources']['cuda_peak_allocated_bytes']}
+                for result in results
+            ]
+            table = pd.DataFrame(rows).sort_values('mean_score', ascending=False, kind='stable')
+            atomic_csv_save(table, comparison)
+            return table

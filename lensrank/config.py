@@ -1,13 +1,14 @@
 """Model, data and experiment configuration."""
 
 from dataclasses import dataclass
+
 import torch
 
 
 @dataclass
 class SuiteConfig:
     data_dir: str = 'data'
-    run_dir: str = 'artifacts/fresh_runs'
+    run_dir: str = 'artifacts/retrieval_runs_v1'
     model_name: str = 'ViT-B-16'
     pretrained: str = 'openai'
     epochs: int = 5

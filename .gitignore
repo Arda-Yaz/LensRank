@@ -11,3 +11,4 @@ data/
 *.pt.tmp
 artifacts/**/failure.json
 artifacts/**/last.*
+.run.lock
