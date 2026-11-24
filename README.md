@@ -1,8 +1,16 @@
 # LensRank
 
-LensRank is a multimodal retrieval application with a Gradio interface for text-to-image and image-to-caption search.
-It uses OpenCLIP ViT-B-16/OpenAI with LoRA adapters and searches the validation collection.
-The active experiment is selected by sorting `artifacts/fresh_runs/fresh_comparison.csv` by `mean_score`.
+LensRank is an OpenCLIP retrieval benchmark and Gradio demo for text-to-image and image-to-caption search. It compares zero-shot inference, projection tuning, gradual unfreezing, full fine-tuning, and LoRA on a shared ViT-B-16 backbone.
+
+- **Training** uses deterministic batches with unique image IDs to avoid treating captions of the same image as negatives.
+- **Evaluation** measures Recall@1/5/10 in both directions and evaluates a frozen validation checkpoint on held-out queries.
+- **Reproducibility** includes checkpointed training state, data and weight fingerprints, and offline regression tests for resume and retrieval.
+
+## Benchmark results
+
+On an RTX 5060, Full fine-tuning reached **92.17% mean validation Recall** across three seeds. LoRA reached **91.96%** and completed training and validation in **23.14 minutes on average**, compared with **38.28 minutes** for Full. The selected Full checkpoint reached **89.93%** on the held-out test split. The test score applies to that checkpoint. [Protocol, per-seed results, and reproduction commands](BENCHMARK.md)
+
+The code and benchmark summaries are included in the repository. The dataset, model checkpoints, and embedding cache are local assets. The offline tests use synthetic fixtures and run without those assets.
 
 ## Installation
 
@@ -24,6 +32,8 @@ python -m venv .venv
 
 Enter a natural-language description in **Text → Images**, or upload an image in **Image → Captions**.
 Both search modes support 1–10 results.
+
+The demo uses the historical LoRA checkpoint and searches the validation collection. For the local asset layout and checksums, see [SOURCE_MANIFEST.md](SOURCE_MANIFEST.md).
 
 The application builds validation embeddings in `artifacts/fresh_runs/demo_validation_index.pt` on first launch.
 The cache is reused while the checkpoint modification timestamp matches.
@@ -52,7 +62,11 @@ Run the training notebook with its new `artifacts/retrieval_runs_v1` output dire
 
 Each epoch visits every selected training pair in deterministic batches with unique image IDs. A singleton batch advances the checkpoint cursor without an AdamW update because it has no contrastive negatives. Epoch loss averages the batches with at least two images. Its value is empty when the epoch has no such batch. Resume relies on the deterministic OpenCLIP validation transform used for pair loading and deterministic tokenization in the workers. The CPU regression covers training with identical software, data and configuration. Gradual unfreezing starts a new AdamW when all parameters become trainable and carries forward the AMP scaler.
 
-`run.json` records the resolved training identity. Image identity uses the manifest checksums and checks file sizes. Refresh the manifest after replacing images. `completed.json` records each AdamW parameter stage and the selected checkpoint. Elapsed seconds cover training and validation after setup, including data loading and in-loop persistence. Resume sums elapsed seconds from checkpointed segments and takes the maximum CUDA peak across them. CUDA peak is allocated tensor memory in bytes from `torch.cuda.max_memory_allocated` and is inapplicable on CPU.
+`run.json` records the original run ID and its resolved training inputs. Resume accepts a moved run directory or a documentation-only commit when the execution fingerprint matches. For assets outside the manifest, keep file sizes and modification times intact when moving the dataset. Resume also checks that the checkpoint and run metadata belong to the same original run.
+
+Routine training startup checks the sizes of manifest-listed images. The paired benchmark verifies their SHA-256 hashes before training, and final evaluation verifies them before inference. Images outside the manifest use a size and modification-time fingerprint. Refresh the manifest after intentional dataset changes.
+
+`completed.json` records each AdamW parameter stage and the selected checkpoint. Elapsed time covers training and validation after setup, including data loading and in-loop persistence. Resume sums elapsed seconds from checkpointed segments and takes the maximum CUDA peak across them. CUDA peak comes from `torch.cuda.max_memory_allocated` and is inapplicable on CPU.
 
 After validation, freeze the winning experiment, epoch and checkpoint, then evaluate that selection separately.
 
@@ -62,6 +76,8 @@ After validation, freeze the winning experiment, epoch and checkpoint, then eval
 ```
 
 The final report uses the queries from `test.csv` and the full candidate pools derived from test image filenames and caption ownership. It reports local ground-truth Recall in both directions. For historical validation records, use `artifacts/fresh_runs` as the selection source and provide a new path for both JSON outputs. Historical best checkpoints identify their selection through the recorded validation score and the checkpoint hash. New checkpoints also store the selected epoch and run ID. Keep final test scores out of model and hyperparameter selection.
+
+If you move a run directory after freezing its selection, run `select` again with the new run directory and a fresh JSON output path.
 
 ## Verification
 
